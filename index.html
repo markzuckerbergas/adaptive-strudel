@@ -1,0 +1,219 @@
+<!doctype html>
+<!--
+  Adaptive-music game POC.
+
+  A tiny top-down game where the MUSIC follows the player:
+  - Left side  = safe zone   -> calm, dreamy melody
+  - Right side = enemy zone  -> the beat builds, layer by layer
+
+  How the music updates smoothly:
+  The player's "danger" (0..1, based on position + enemy proximity) is
+  smoothed every frame, then mapped to an intensity LEVEL (0..4). Only when
+  the level changes do we call Strudel's evaluate() with a new stack.
+  Strudel hot-swaps the running pattern *in phase with the global cycle
+  clock* (same as pressing Ctrl+Enter in the REPL), so layers that both
+  versions share keep playing seamlessly and new layers join on the grid —
+  no abrupt cut. Hysteresis on the level thresholds stops the music from
+  flip-flopping when the player hovers on a boundary.
+
+  Run: double-click this file, or `python3 -m http.server` and open
+  http://localhost:8000 - then click START (browsers only allow audio
+  after a click).
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Strudel adaptive-music game</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #14161a; color: #eee;
+         display: flex; flex-direction: column; align-items: center; gap: .6rem; }
+  canvas { border: 1px solid #444; border-radius: 6px; }
+  #hud { display: flex; align-items: center; gap: 1rem; width: 800px; }
+  #meter { flex: 1; height: 14px; background: #2a2d33; border-radius: 7px; overflow: hidden; }
+  #meterFill { height: 100%; width: 0%; background: linear-gradient(90deg, #3ecf6a, #e8c33a, #e05252); }
+  button { padding: .45rem 1.2rem; border: 0; border-radius: 6px; font-size: 1rem; cursor: pointer; }
+  #level { min-width: 11rem; text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<h3>Strudel adaptive music — walk right toward the enemies (WASD / arrows)</h3>
+<div id="hud">
+  <button id="start">▶ start</button>
+  <button id="stop">■ stop</button>
+  <div id="meter"><div id="meterFill"></div></div>
+  <div id="level">danger 0.00 · level 0</div>
+</div>
+<canvas id="game" width="800" height="500"></canvas>
+
+<script src="https://unpkg.com/@strudel/web@1.0.3"></script>
+<script>
+// ---------------------------------------------------------------------------
+// Strudel setup
+// ---------------------------------------------------------------------------
+initStrudel({
+  // bd / sd / hh / oh live in the dirt-samples pack
+  prebake: () => samples('github:tidalcycles/dirt-samples'),
+});
+
+// One melody used at EVERY level (A-minor pentatonic) — keeping the notes
+// identical across levels is what makes the shift feel like the *same tune*
+// getting more intense, not a song change.
+const MELODY = '"a3 [c4 e4] a4 [g4 e4] a3 [c4 e4] g4 [e4 c4]"';
+
+// Each intensity level is a full Strudel program. Adjacent levels share as
+// many identical layers as possible, so the hot-swap keeps them continuous.
+function codeFor(level) {
+  const layers = [];
+
+  if (level === 0)      // dreamy: half-speed melody, dark filter, lots of space
+    layers.push(`note(${MELODY}).slow(2).sound("triangle").lpf(800).room(.6).gain(.5)`);
+  else if (level === 1) // melody at full speed, a heartbeat kick appears
+    layers.push(`note(${MELODY}).sound("triangle").lpf(1100).room(.5).gain(.5)`,
+                `sound("bd ~ ~ ~").gain(.8)`);
+  else                  // melody turns sawtooth and brightens with each level
+    layers.push(`note(${MELODY}).sound("sawtooth").lpf(${800 + level * 500}).room(.35).gain(.42)`);
+
+  if (level >= 2)
+    layers.push(`sound("bd*4").gain(.9)`,
+                `sound("[~ hh]*4").gain(.4)`,
+                `note("a1*4").sound("sawtooth").lpf(500).gain(.55)`);
+  if (level >= 3)
+    layers.push(`sound("~ sd ~ sd").gain(.7)`,
+                `sound("hh*8").gain("[.3 .5]*4")`);
+  if (level >= 4)
+    layers.push(`note("a1*8").sound("sawtooth").lpf(800).gain(.6)`,
+                `sound("hh*16").gain("[.25 .55]*8")`,
+                `sound("~ ~ ~ oh").gain(.4)`);
+
+  // Tempo: setcpm() is a REPL helper that @strudel/web registers late in its
+  // async init, so evaluated code can't rely on it. Instead we slow the whole
+  // stack: the default is 0.5 cycles/sec (= 120 BPM at 4 beats per cycle),
+  // and .slow(1.2) brings that to 100 BPM.
+  return `stack(\n  ${layers.join(',\n  ')}\n).slow(1.2)`;
+}
+
+// ---------------------------------------------------------------------------
+// Game state
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const SAFE_X = W * 0.33;    // left of this line = fully safe
+const DANGER_X = W * 0.66;  // right of this line = full danger
+
+const player = { x: 80, y: H / 2, r: 12, speed: 3.2 };
+const enemies = [
+  { x: 640, y: 120, r: 10, dx: 1.1, dy: 0.9 },
+  { x: 700, y: 300, r: 10, dx: -0.8, dy: 1.2 },
+  { x: 600, y: 420, r: 10, dx: 1.3, dy: -0.7 },
+];
+
+let danger = 0;       // smoothed 0..1
+let level = 0;        // current music intensity 0..4
+let playing = false;
+
+const keys = {};
+addEventListener('keydown', e => { keys[e.key] = true; });
+addEventListener('keyup',   e => { keys[e.key] = false; });
+
+// ---------------------------------------------------------------------------
+// Danger -> level (with hysteresis so we don't flap on a boundary)
+// ---------------------------------------------------------------------------
+const UP   = [0.15, 0.35, 0.60, 0.82]; // cross above UP[i]   -> level i+1
+const DOWN = [0.08, 0.27, 0.52, 0.74]; // fall below DOWN[i]  -> level i
+
+// evaluate() is async and can fail (e.g. clicked before init finished, or a
+// sample fetch still pending) — surface that in the HUD instead of silence.
+function playLevel() {
+  evaluate(codeFor(level)).catch(err => {
+    document.getElementById('level').textContent = `audio error: ${err.message}`;
+    console.error(err);
+  });
+}
+
+function updateLevel() {
+  let next = level;
+  while (next < 4 && danger > UP[next]) next++;
+  while (next > 0 && danger < DOWN[next - 1]) next--;
+  if (next !== level) {
+    level = next;
+    if (playing) playLevel(); // in-phase hot-swap = smooth shift
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+function step() {
+  // move player
+  if (keys.ArrowLeft  || keys.a) player.x -= player.speed;
+  if (keys.ArrowRight || keys.d) player.x += player.speed;
+  if (keys.ArrowUp    || keys.w) player.y -= player.speed;
+  if (keys.ArrowDown  || keys.s) player.y += player.speed;
+  player.x = Math.max(player.r, Math.min(W - player.r, player.x));
+  player.y = Math.max(player.r, Math.min(H - player.r, player.y));
+
+  // move enemies (bounce inside the enemy zone)
+  for (const e of enemies) {
+    e.x += e.dx; e.y += e.dy;
+    if (e.x < DANGER_X + e.r || e.x > W - e.r) e.dx *= -1;
+    if (e.y < e.r || e.y > H - e.r) e.dy *= -1;
+  }
+
+  // target danger: position ramp + proximity boost from the nearest enemy
+  const ramp = Math.max(0, Math.min(1, (player.x - SAFE_X) / (DANGER_X - SAFE_X)));
+  const nearest = Math.min(...enemies.map(e => Math.hypot(e.x - player.x, e.y - player.y)));
+  const boost = Math.max(0, 1 - nearest / 220) * 0.35;
+  const target = Math.min(1, ramp + boost);
+
+  // smooth it — this is what makes the shift gradual, not a jump
+  danger += (target - danger) * 0.03;
+  updateLevel();
+
+  draw();
+  requestAnimationFrame(step);
+}
+
+function draw() {
+  // zones
+  const grad = ctx.createLinearGradient(0, 0, W, 0);
+  grad.addColorStop(0, '#173a24'); grad.addColorStop(.33, '#173a24');
+  grad.addColorStop(.66, '#3a1717'); grad.addColorStop(1, '#3a1717');
+  ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(255,255,255,.06)';
+  ctx.fillRect(SAFE_X, 0, 1, H); ctx.fillRect(DANGER_X, 0, 1, H);
+  ctx.fillStyle = '#9fdcb2'; ctx.font = '13px system-ui';
+  ctx.fillText('SAFE', 20, 24);
+  ctx.fillStyle = '#e3a0a0';
+  ctx.fillText('ENEMIES', W - 80, 24);
+
+  // enemies + player
+  for (const e of enemies) {
+    ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, 7);
+    ctx.fillStyle = '#e05252'; ctx.fill();
+  }
+  ctx.beginPath(); ctx.arc(player.x, player.y, player.r, 0, 7);
+  ctx.fillStyle = '#3ecf6a'; ctx.fill();
+
+  // HUD
+  document.getElementById('meterFill').style.width = `${(danger * 100).toFixed(1)}%`;
+  document.getElementById('level').textContent =
+    `danger ${danger.toFixed(2)} · level ${level}`;
+}
+
+// ---------------------------------------------------------------------------
+// Controls (audio may only start after a click — browser autoplay policy)
+// ---------------------------------------------------------------------------
+document.getElementById('start').addEventListener('click', () => {
+  playing = true;
+  playLevel();
+});
+document.getElementById('stop').addEventListener('click', () => {
+  playing = false;
+  hush();
+});
+
+step();
+</script>
+</body>
+</html>
