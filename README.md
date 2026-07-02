@@ -3,7 +3,7 @@
 A proof of concept for **adaptive game music with [Strudel](https://strudel.cc)**:
 a tiny top-down game where the soundtrack reacts to what you do. Walk from the
 safe zone toward the enemies and the music smoothly builds from a dreamy melody
-into a driving beat — layer by layer, never with an abrupt cut.
+into a driving beat — continuously, never with an abrupt cut.
 
 **▶ Play it: <https://markzuckerbergas.github.io/adaptive-strudel/>**
 
@@ -14,35 +14,42 @@ Click **start** (browsers require a click before audio), then move with
 
 Everything is in a single [`index.html`](./index.html) — a canvas game plus the
 [`@strudel/web`](https://www.npmjs.com/package/@strudel/web) live-coding engine
-loaded from a CDN. Three pieces make the music adaptive:
+loaded from a CDN.
+
+The soundtrack is **one `stack()` of ~12 layers, started once and never
+replaced**. The bridge between game and music is Strudel's `signal()`, which
+samples a JavaScript function on every pattern query:
+
+```js
+let danger = 0; // game state, smoothed every frame
+
+const ramp = (from, to) =>
+  Math.min(1, Math.max(0, (danger - from) / (to - from)));
+
+sound('bd*4').gain(signal(() => ramp(.3, .45) * .9)) // kick fades in at danger .3–.45
+```
 
 1. **A danger value (0..1).** Each frame the game computes a target from the
-   player's position (a ramp across the middle strip) plus a boost when an
-   enemy is near, then eases the real value toward it
-   (`danger += (target - danger) * 0.03`) so the music drifts rather than jumps.
+   player's position plus a boost when an enemy is near, then eases the real
+   value toward it (`danger += (target - danger) * 0.03`). Because the music
+   reads `danger` live, that easing *is* the musical transition.
 
-2. **Danger → intensity level (0–4), with hysteresis.** The level rises at
-   `0.15 / 0.35 / 0.60 / 0.82` but only falls back at lower thresholds, so
-   hovering on a boundary can't make the music flip-flop.
+2. **One fade window per layer.** Every layer's gain is a `signal()` built
+   from `ramp(from, to)`, so layers enter one after another as danger rises —
+   melody → heartbeat kick → four-on-the-floor → hats & bass → snare → full
+   drive — and leave in reverse as it falls. Layers that replace each other
+   (heartbeat vs. 4-floor kick, 4th vs. 8th bass) crossfade. Some filter
+   cutoffs ride the same signal, so the melody also *brightens* with danger.
 
-3. **Level change → `evaluate()` hot-swap.** Each level is a full Strudel
-   program (a `stack()` of layers). On a level change the game re-`evaluate`s
-   it, and Strudel replaces the running pattern *in phase with the global
-   cycle clock* — exactly like pressing `Ctrl+Enter` in the strudel.cc REPL.
-   Layers shared by both versions continue seamlessly; new ones join on the
-   grid.
+3. **The same melody at every intensity** (A-minor pentatonic) — only speed,
+   brightness and the layers around it change, so it reads as one tune
+   intensifying, not a song change.
 
-The melody is the same A-minor pentatonic line at every level — only the
-speed, brightness and drum layers change — so the shift reads as one tune
-intensifying, not a song change:
-
-| Level | What you hear |
-|-------|---------------|
-| 0 | half-speed triangle melody, dark filter, big reverb |
-| 1 | melody at full speed + a heartbeat kick |
-| 2 | four-on-the-floor kick, offbeat hats, a pulsing bass |
-| 3 | + snare backbeat, busier hats |
-| 4 | + driving 8th-note bass, 16th hats, open-hat lift |
+An earlier version re-`evaluate()`d a new stack per intensity level; the
+single-track + signals design (suggested by the Strudel Discord community)
+is simpler, fully continuous, and avoids re-evaluation entirely. If CPU ever
+matters (e.g. on phones), the next optimization is `.mask()` on silent layers
+so they produce no events at all.
 
 ## Run it locally
 

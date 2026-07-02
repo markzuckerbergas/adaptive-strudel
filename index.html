@@ -1,20 +1,19 @@
 <!doctype html>
 <!--
-  Adaptive-music game POC.
+  Adaptive-music game POC — "single track" version.
 
   A tiny top-down game where the MUSIC follows the player:
   - Left side  = safe zone   -> calm, dreamy melody
   - Right side = enemy zone  -> the beat builds, layer by layer
 
-  How the music updates smoothly:
-  The player's "danger" (0..1, based on position + enemy proximity) is
-  smoothed every frame, then mapped to an intensity LEVEL (0..4). Only when
-  the level changes do we call Strudel's evaluate() with a new stack.
-  Strudel hot-swaps the running pattern *in phase with the global cycle
-  clock* (same as pressing Ctrl+Enter in the REPL), so layers that both
-  versions share keep playing seamlessly and new layers join on the grid —
-  no abrupt cut. Hysteresis on the level thresholds stops the music from
-  flip-flopping when the player hovers on a boundary.
+  How the music adapts (v2, after advice from the Strudel Discord):
+  ONE stack() is started once and never re-evaluated. Every layer's gain
+  (and some filter cutoffs) is a Strudel signal() that samples the game's
+  `danger` variable (0..1) on every query — so the mix follows the player
+  CONTINUOUSLY. Each layer fades in over its own danger window (see ramp()),
+  which staggers the entrances: melody -> heartbeat kick -> four-on-the-floor
+  -> hats/bass -> snare -> full drive. No evaluate() hot-swaps, no discrete
+  intensity levels, no hysteresis needed.
 
   Run: double-click this file, or `python3 -m http.server` and open
   http://localhost:8000 - then click START (browsers only allow audio
@@ -41,7 +40,7 @@
   <button id="start">▶ start</button>
   <button id="stop">■ stop</button>
   <div id="meter"><div id="meterFill"></div></div>
-  <div id="level">danger 0.00 · level 0</div>
+  <div id="level">danger 0.00</div>
 </div>
 <canvas id="game" width="800" height="500"></canvas>
 
@@ -55,41 +54,57 @@ initStrudel({
   prebake: () => samples('github:tidalcycles/dirt-samples'),
 });
 
-// One melody used at EVERY level (A-minor pentatonic) — keeping the notes
-// identical across levels is what makes the shift feel like the *same tune*
-// getting more intense, not a song change.
-const MELODY = '"a3 [c4 e4] a4 [g4 e4] a3 [c4 e4] g4 [e4 c4]"';
+let danger = 0; // 0..1, smoothed every frame by the game loop below
 
-// Each intensity level is a full Strudel program. Adjacent levels share as
-// many identical layers as possible, so the hot-swap keeps them continuous.
-function codeFor(level) {
-  const layers = [];
+// ramp(from, to): 0 below `from`, 1 above `to`, linear in between.
+// Each layer gets its own window, so layers enter one after another as
+// danger rises — and fade back out in reverse when it falls.
+const ramp = (from, to) => Math.min(1, Math.max(0, (danger - from) / (to - from)));
 
-  if (level === 0)      // dreamy: half-speed melody, dark filter, lots of space
-    layers.push(`note(${MELODY}).slow(2).sound("triangle").lpf(800).room(.6).gain(.5)`);
-  else if (level === 1) // melody at full speed, a heartbeat kick appears
-    layers.push(`note(${MELODY}).sound("triangle").lpf(1100).room(.5).gain(.5)`,
-                `sound("bd ~ ~ ~").gain(.8)`);
-  else                  // melody turns sawtooth and brightens with each level
-    layers.push(`note(${MELODY}).sound("sawtooth").lpf(${800 + level * 500}).room(.35).gain(.42)`);
+// sig(fn): a Strudel pattern that calls fn on every query — the live bridge
+// between the game's JS state and the running music.
+const sig = fn => signal(fn);
 
-  if (level >= 2)
-    layers.push(`sound("bd*4").gain(.9)`,
-                `sound("[~ hh]*4").gain(.4)`,
-                `note("a1*4").sound("sawtooth").lpf(500).gain(.55)`);
-  if (level >= 3)
-    layers.push(`sound("~ sd ~ sd").gain(.7)`,
-                `sound("hh*8").gain("[.3 .5]*4")`);
-  if (level >= 4)
-    layers.push(`note("a1*8").sound("sawtooth").lpf(800).gain(.6)`,
-                `sound("hh*16").gain("[.25 .55]*8")`,
-                `sound("~ ~ ~ oh").gain(.4)`);
+// One melody at every intensity (A-minor pentatonic) — the layers around it
+// change, so it reads as the same tune intensifying, not a song change.
+const MEL = 'a3 [c4 e4] a4 [g4 e4] a3 [c4 e4] g4 [e4 c4]';
 
-  // Tempo: setcpm() is a REPL helper that @strudel/web registers late in its
-  // async init, so evaluated code can't rely on it. Instead we slow the whole
-  // stack: the default is 0.5 cycles/sec (= 120 BPM at 4 beats per cycle),
-  // and .slow(1.2) brings that to 100 BPM.
-  return `stack(\n  ${layers.join(',\n  ')}\n).slow(1.2)`;
+// The whole soundtrack: started once, never replaced. Layer order = the
+// order they join as you approach the enemies.
+function buildTrack() {
+  return stack(
+    // dreamy half-speed melody — the safe zone sound; fades OUT as danger rises
+    note(MEL).slow(2).sound('triangle').lpf(800).room(.6)
+      .gain(sig(() => (1 - ramp(.08, .22)) * .5)),
+
+    // full-speed melody — takes over from the dreamy one, brightens with danger
+    note(MEL).sound('triangle').room(.4)
+      .lpf(sig(() => 900 + ramp(.2, 1) * 2100))
+      .gain(sig(() => ramp(.08, .22) * .5)),
+
+    // sawtooth doubling of the melody — extra bite at high danger
+    note(MEL).sound('sawtooth').room(.3)
+      .lpf(sig(() => 1200 + ramp(.5, 1) * 1600))
+      .gain(sig(() => ramp(.5, .75) * .35)),
+
+    // heartbeat kick — enters early, hands over to the four-on-the-floor
+    sound('bd ~ ~ ~').gain(sig(() => ramp(.1, .2) * (1 - ramp(.3, .42)) * .8)),
+    sound('bd*4').gain(sig(() => ramp(.3, .45) * .9)),
+
+    // offbeat hats + pulsing bass
+    sound('[~ hh]*4').gain(sig(() => ramp(.32, .5) * .4)),
+    note('a1*4').sound('sawtooth').lpf(500)
+      .gain(sig(() => ramp(.35, .55) * (1 - ramp(.75, .85)) * .55)),
+
+    // snare backbeat + busier hats
+    sound('~ sd ~ sd').gain(sig(() => ramp(.55, .7) * .7)),
+    sound('hh*8').gain(sig(() => ramp(.6, .78) * .4)),
+
+    // full drive: 8th-note bass (replaces the 4ths), 16th hats, open-hat lift
+    note('a1*8').sound('sawtooth').lpf(800).gain(sig(() => ramp(.75, .9) * .6)),
+    sound('hh*16').gain(sig(() => ramp(.82, .96) * .5)),
+    sound('~ ~ ~ ho').gain(sig(() => ramp(.85, 1) * .4)), // ho = open hat in dirt-samples
+  ).slow(1.2); // default 0.5 cps = 120 BPM at 4 beats/cycle -> 100 BPM
 }
 
 // ---------------------------------------------------------------------------
@@ -108,38 +123,9 @@ const enemies = [
   { x: 600, y: 420, r: 10, dx: 1.3, dy: -0.7 },
 ];
 
-let danger = 0;       // smoothed 0..1
-let level = 0;        // current music intensity 0..4
-let playing = false;
-
 const keys = {};
 addEventListener('keydown', e => { keys[e.key] = true; });
 addEventListener('keyup',   e => { keys[e.key] = false; });
-
-// ---------------------------------------------------------------------------
-// Danger -> level (with hysteresis so we don't flap on a boundary)
-// ---------------------------------------------------------------------------
-const UP   = [0.15, 0.35, 0.60, 0.82]; // cross above UP[i]   -> level i+1
-const DOWN = [0.08, 0.27, 0.52, 0.74]; // fall below DOWN[i]  -> level i
-
-// evaluate() is async and can fail (e.g. clicked before init finished, or a
-// sample fetch still pending) — surface that in the HUD instead of silence.
-function playLevel() {
-  evaluate(codeFor(level)).catch(err => {
-    document.getElementById('level').textContent = `audio error: ${err.message}`;
-    console.error(err);
-  });
-}
-
-function updateLevel() {
-  let next = level;
-  while (next < 4 && danger > UP[next]) next++;
-  while (next > 0 && danger < DOWN[next - 1]) next--;
-  if (next !== level) {
-    level = next;
-    if (playing) playLevel(); // in-phase hot-swap = smooth shift
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Main loop
@@ -161,14 +147,13 @@ function step() {
   }
 
   // target danger: position ramp + proximity boost from the nearest enemy
-  const ramp = Math.max(0, Math.min(1, (player.x - SAFE_X) / (DANGER_X - SAFE_X)));
+  const posRamp = Math.max(0, Math.min(1, (player.x - SAFE_X) / (DANGER_X - SAFE_X)));
   const nearest = Math.min(...enemies.map(e => Math.hypot(e.x - player.x, e.y - player.y)));
   const boost = Math.max(0, 1 - nearest / 220) * 0.35;
-  const target = Math.min(1, ramp + boost);
+  const target = Math.min(1, posRamp + boost);
 
-  // smooth it — this is what makes the shift gradual, not a jump
+  // smooth it — the music reads `danger` live, so this easing IS the transition
   danger += (target - danger) * 0.03;
-  updateLevel();
 
   draw();
   requestAnimationFrame(step);
@@ -197,21 +182,21 @@ function draw() {
 
   // HUD
   document.getElementById('meterFill').style.width = `${(danger * 100).toFixed(1)}%`;
-  document.getElementById('level').textContent =
-    `danger ${danger.toFixed(2)} · level ${level}`;
+  document.getElementById('level').textContent = `danger ${danger.toFixed(2)}`;
 }
 
 // ---------------------------------------------------------------------------
 // Controls (audio may only start after a click — browser autoplay policy)
 // ---------------------------------------------------------------------------
 document.getElementById('start').addEventListener('click', () => {
-  playing = true;
-  playLevel();
+  try {
+    buildTrack().play(); // starts once; signals do all the adapting from here
+  } catch (err) {
+    document.getElementById('level').textContent = `audio error: ${err.message}`;
+    console.error(err);
+  }
 });
-document.getElementById('stop').addEventListener('click', () => {
-  playing = false;
-  hush();
-});
+document.getElementById('stop').addEventListener('click', () => hush());
 
 step();
 </script>
