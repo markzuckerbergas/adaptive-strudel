@@ -60,3 +60,14 @@ python3 -m http.server
 
 (Or just double-click `index.html`. The first run needs internet once, to
 fetch `@strudel/web` and the drum samples.)
+
+## License
+
+This project is licensed under the **GNU AGPL-3.0** — see [LICENSE](./LICENSE).
+
+It embeds [Strudel](https://strudel.cc), which is
+[AGPL-3.0 licensed](https://codeberg.org/uzu/strudel/src/branch/main/LICENSE.md);
+per its terms ([respect the license](https://strudel.cc/technical-manual/project-start/#respect-the-license)),
+anything integrating Strudel must be distributed under a compatible
+free/open-source license with its source available — which this repo is:
+the deployed page links back here, and changes are tracked in the git history.
